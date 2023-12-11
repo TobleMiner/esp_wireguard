@@ -134,6 +134,12 @@ void wireguardif_shutdown(struct netif *netif);
 // Is the given peer "up"? A peer is up if it has a valid session key it can communicate with
 err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *current_ip, u16_t *current_port);
 
+// Bind WireGuard interface to an underlying netif. Noop if statically bound
+void wireguardif_bind_underlying_weak(struct netif *netif, struct netif *underlying_netif);
+
+// Unbind WireGuard interface from underlying netif. Noop if statically bound
+void wireguardif_unbind_underlying_weak(struct netif *netif);
+
 #ifdef __cplusplus
 }
 #endif

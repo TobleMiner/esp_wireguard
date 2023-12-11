@@ -178,6 +178,7 @@ struct wireguard_device {
 	struct udp_pcb *udp_pcb;
 
 	struct netif *underlying_netif;
+    bool underlying_netif_bound;
 
 	uint8_t public_key[WIREGUARD_PUBLIC_KEY_LEN];
 	uint8_t private_key[WIREGUARD_PRIVATE_KEY_LEN];

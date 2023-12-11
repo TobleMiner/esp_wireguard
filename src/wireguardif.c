@@ -91,11 +91,19 @@ static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct
 	struct wireguard_device *device = (struct wireguard_device *)netif->state;
 	// Send to last know port, not the connect port
 	//TODO: Support DSCP and ECN - lwip requires this set on PCB globally, not per packet
-	return udp_sendto_if(device->udp_pcb, q, &peer->ip, peer->port, device->underlying_netif);
+	if (device->underlying_netif != NULL) {
+		return udp_sendto_if(device->udp_pcb, q, &peer->ip, peer->port, device->underlying_netif);
+	} else {
+		return udp_sendto(device->udp_pcb, q, &peer->ip, peer->port);
+	}
 }
 
 static err_t wireguardif_device_output(struct wireguard_device *device, struct pbuf *q, const ip_addr_t *ipaddr, u16_t port) {
-	return udp_sendto_if(device->udp_pcb, q, ipaddr, port, device->underlying_netif);
+	if (device->underlying_netif != NULL) {
+		return udp_sendto_if(device->udp_pcb, q, ipaddr, port, device->underlying_netif);
+	} else {
+		return udp_sendto(device->udp_pcb, q, ipaddr, port);
+	}
 }
 
 static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, const ip_addr_t *ipaddr, struct wireguard_peer *peer) {
@@ -894,39 +902,11 @@ static void wireguardif_tmr(void *arg) {
 
 err_t wireguardif_init(struct netif *netif) {
 	err_t result;
-	esp_err_t err;
 	struct wireguardif_init_data *init_data;
 	struct wireguard_device *device;
 	struct udp_pcb *udp;
 	uint8_t private_key[WIREGUARD_PRIVATE_KEY_LEN];
 	size_t private_key_len = sizeof(private_key);
-
-#if defined(CONFIG_WIREGUARD_ESP_NETIF)
-	struct netif* underlying_netif = NULL;
-	char lwip_netif_name[8] = {0,};
-
-	err = esp_netif_get_netif_impl_name(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), lwip_netif_name);
-	if (err != ESP_OK) {
-		ESP_LOGE(TAG, "esp_netif_get_netif_impl_name: %s", esp_err_to_name(err));
-		result = ERR_IF;
-		goto fail;
-	}
-	underlying_netif = netif_find(lwip_netif_name);
-	if (underlying_netif == NULL) {
-		ESP_LOGE(TAG, "netif_find: cannot find WIFI_STA_DEF");
-		result = ERR_IF;
-		goto fail;
-	}
-#elif defined(CONFIG_WIREGUARD_ESP_TCPIP_ADAPTER)
-	void *underlying_netif = NULL;
-	err = tcpip_adapter_get_netif(TCPIP_ADAPTER_IF_STA, &underlying_netif);
-	if (err != ESP_OK) {
-		ESP_LOGE(TAG, "tcpip_adapter_get_netif: %s", esp_err_to_name(err));
-		result = ERR_IF;
-		goto fail;
-	}
-#endif
-	ESP_LOGD(TAG, "underlying_netif = %p", underlying_netif);
 
 	LWIP_ASSERT("netif != NULL", (netif != NULL));
 	LWIP_ASSERT("state != NULL", (netif->state != NULL));
@@ -953,8 +933,11 @@ err_t wireguardif_init(struct netif *netif) {
 					device = (struct wireguard_device *)mem_calloc(1, sizeof(struct wireguard_device));
 					if (device) {
 						device->netif = netif;
-						device->underlying_netif = underlying_netif;
-						udp_bind_netif(udp, underlying_netif);
+						device->underlying_netif = init_data->bind_netif;
+						if (init_data->bind_netif) {
+							udp_bind_netif(udp, init_data->bind_netif);
+							device->underlying_netif_bound = true;
+						}
 
 						device->udp_pcb = udp;
 						// Per-wireguard netif/device setup
@@ -1006,7 +989,6 @@ err_t wireguardif_init(struct netif *netif) {
 	} else {
 		result = ERR_ARG;
 	}
-fail:
 	return result;
 }
 
@@ -1040,5 +1022,25 @@ void wireguardif_shutdown(struct netif *netif) {
 	// remove device context.
 	free(device);
 	netif->state = NULL;
+}
+
+void wireguardif_bind_underlying_weak(struct netif *netif, struct netif *underlying_netif) {
+	LWIP_ASSERT("netif != NULL", (netif != NULL));
+	LWIP_ASSERT("state != NULL", (netif->state != NULL));
+
+	struct wireguard_device *device = (struct wireguard_device *)netif->state;
+	if (!device->underlying_netif_bound) {
+		device->underlying_netif = underlying_netif;
+	}
+}
+
+void wireguardif_unbind_underlying_weak(struct netif *netif) {
+	LWIP_ASSERT("netif != NULL", (netif != NULL));
+	LWIP_ASSERT("state != NULL", (netif->state != NULL));
+
+	struct wireguard_device *device = (struct wireguard_device *)netif->state;
+	if (!device->underlying_netif_bound) {
+		device->underlying_netif = NULL;
+	}
 }
 // vim: noexpandtab

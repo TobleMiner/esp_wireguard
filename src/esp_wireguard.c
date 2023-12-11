@@ -167,6 +167,15 @@ static esp_err_t esp_wireguard_netif_create(const wireguard_config_t *config)
     wg.private_key = config->private_key;
     wg.listen_port = config->listen_port;
     wg.bind_netif = NULL;
+    if (config->bind_netif != NULL) {
+        struct netif* bind_if = netif_find(config->bind_netif);
+        if (bind_if == NULL) {
+            ESP_LOGE(TAG, "Unknown bind interface `%s`", config->bind_netif);
+            err = ESP_ERR_INVALID_ARG;
+            goto fail;
+        }
+        wg.bind_netif = bind_if;
+    }
 
     ESP_LOGI(TAG, "allowed_ip: %s", config->allowed_ip);
 
@@ -219,7 +228,7 @@ esp_err_t esp_wireguard_init(wireguard_config_t *config, wireguard_ctx_t *ctx)
     }
     ctx->config = config;
     ctx->netif = NULL;
-    ctx->netif_default = netif_default;
+    ctx->netif_default = NULL;
 
     err = ESP_OK;
 fail:
@@ -261,7 +270,6 @@ esp_err_t esp_wireguard_connect(wireguard_ctx_t *ctx)
             goto fail;
         }
         ctx->netif = wg_netif;
-        ctx->netif_default = netif_default;
     }
 
     ESP_LOGI(TAG, "Connecting to %s:%i", ctx->config->endpoint, ctx->config->port);
@@ -283,6 +291,8 @@ esp_err_t esp_wireguard_set_default(wireguard_ctx_t *ctx)
         err = ESP_ERR_INVALID_ARG;
         goto fail;
     }
+    ctx->netif_default = netif_default;
+	wireguardif_bind_underlying_weak(ctx->netif, ctx->netif_default);
     netif_set_default(ctx->netif);
     err = ESP_OK;
 fail:
@@ -312,7 +322,10 @@ esp_err_t esp_wireguard_disconnect(wireguard_ctx_t *ctx)
     wireguard_peer_index = WIREGUARDIF_INVALID_INDEX;
     wireguardif_shutdown(ctx->netif);
     netif_remove(ctx->netif);
-    netif_set_default(ctx->netif_default);
+    if (ctx->netif_default) {
+		wireguardif_unbind_underlying_weak(ctx->netif);
+        netif_set_default(ctx->netif_default);
+    }
     ctx->netif = NULL;
 
     err = ESP_OK;
