@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2022 Tomoyuki Sakurai <y@trombik.org>
+ * Copyright (c) 2023 Tobias Schramm <t.schramm@t-sys.eu>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification,
@@ -52,18 +53,16 @@
 #define WG_ADDRSTRLEN  INET_ADDRSTRLEN
 #endif
 
-static struct netif wg_netif_struct = {0};
-static struct netif *wg_netif = NULL;
-static struct wireguardif_peer peer = {0};
-static uint8_t wireguard_peer_index = WIREGUARDIF_INVALID_INDEX;
-static uint8_t preshared_key_decoded[WG_KEY_LEN];
+static bool esp_wireguard_platform_init_done = false;
+static unsigned int esp_wireguard_if_cnt = 0;
 
-static esp_err_t esp_wireguard_peer_init(const wireguard_config_t *config, struct wireguardif_peer *peer)
-{
+static esp_err_t esp_wireguard_peer_init(const esp_wireguard_peer_config_t *config, struct wireguardif_peer *peer, uint8_t *psk_buffer) {
     esp_err_t err;
     char addr_str[WG_ADDRSTRLEN];
     struct addrinfo *res = NULL;
     struct addrinfo hints;
+    ip_addr_t allowed_ip = IPADDR4_INIT_BYTES(0, 0, 0, 0);
+    ip_addr_t allowed_ip_mask = IPADDR4_INIT_BYTES(0, 0, 0, 0);
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -85,7 +84,7 @@ static esp_err_t esp_wireguard_peer_init(const wireguard_config_t *config, struc
 #elif defined(CONFIG_WIREGUARD_x25519_IMPLEMENTATION_NACL)
         ESP_LOGI(TAG, "X25519: NaCL");
 #endif
-        res = mbedtls_base64_decode(preshared_key_decoded, WG_KEY_LEN, &len, (unsigned char *)config->preshared_key, WG_B64_KEY_LEN);
+        res = mbedtls_base64_decode(psk_buffer, WG_KEY_LEN, &len, (unsigned char *)config->preshared_key, WG_B64_KEY_LEN);
         if (res != 0 || len != WG_KEY_LEN) {
             err = ESP_FAIL;
             ESP_LOGE(TAG, "base64_decode: %i", res);
@@ -94,19 +93,28 @@ static esp_err_t esp_wireguard_peer_init(const wireguard_config_t *config, struc
             }
             goto fail;
         }
-        peer->preshared_key = preshared_key_decoded;
+        peer->preshared_key = psk_buffer;
     } else {
         peer->preshared_key = NULL;
     }
     peer->keep_alive = config->persistent_keepalive;
 
-    /* Allow all IPs through tunnel */
-    {
-        ip_addr_t allowed_ip = IPADDR4_INIT_BYTES(0, 0, 0, 0);
-        peer->allowed_ip = allowed_ip;
-        ip_addr_t allowed_mask = IPADDR4_INIT_BYTES(0, 0, 0, 0);
-        peer->allowed_mask = allowed_mask;
-    }
+	if (config->allowed_ip) {
+	    if (ipaddr_aton(config->allowed_ip, &allowed_ip) != 1) {
+	        ESP_LOGE(TAG, "ipaddr_aton: invalid allowed_ip: `%s`", config->allowed_ip);
+	        err = ESP_ERR_INVALID_ARG;
+	        goto fail;
+	    }
+	}
+    peer->allowed_ip = allowed_ip;
+	if (config->allowed_ip_mask) {
+	    if (ipaddr_aton(config->allowed_ip_mask, &allowed_ip_mask) != 1) {
+	        ESP_LOGE(TAG, "ipaddr_aton: invalid allowed_ip_mask: `%s`", config->allowed_ip_mask);
+	        err = ESP_ERR_INVALID_ARG;
+	        goto fail;
+	    }
+	}
+    peer->allowed_mask = allowed_ip_mask;
 
     /* resolve peer name or IP address */
     {
@@ -150,13 +158,13 @@ fail:
     return err;
 }
 
-static esp_err_t esp_wireguard_netif_create(const wireguard_config_t *config)
-{
+static esp_err_t esp_wireguard_netif_create(const esp_wireguard_config_t *config, esp_wireguard_t *wg) {
     esp_err_t err;
     ip_addr_t ip_addr;
     ip_addr_t netmask;
     ip_addr_t gateway = IPADDR4_INIT_BYTES(0, 0, 0, 0);
-    struct wireguardif_init_data wg = {0};
+    struct wireguardif_init_data ifinit = {0};
+	struct netif *wg_netif;
 
     if (!config) {
         err = ESP_ERR_INVALID_ARG;
@@ -164,9 +172,10 @@ static esp_err_t esp_wireguard_netif_create(const wireguard_config_t *config)
     }
 
     /* Setup the WireGuard device structure */
-    wg.private_key = config->private_key;
-    wg.listen_port = config->listen_port;
-    wg.bind_netif = NULL;
+	ifinit.interface_num = esp_wireguard_if_cnt;
+    ifinit.private_key = config->private_key;
+    ifinit.listen_port = config->listen_port;
+    ifinit.bind_netif = NULL;
     if (config->bind_netif != NULL) {
         struct netif* bind_if = netif_find(config->bind_netif);
         if (bind_if == NULL) {
@@ -174,29 +183,36 @@ static esp_err_t esp_wireguard_netif_create(const wireguard_config_t *config)
             err = ESP_ERR_INVALID_ARG;
             goto fail;
         }
-        wg.bind_netif = bind_if;
+        ifinit.bind_netif = bind_if;
     }
 
-    ESP_LOGI(TAG, "allowed_ip: %s", config->allowed_ip);
+    ESP_LOGI(TAG, "local_ip: %s", config->local_ip);
 
-    if (ipaddr_aton(config->allowed_ip, &ip_addr) != 1) {
-        ESP_LOGE(TAG, "ipaddr_aton: invalid allowed_ip: `%s`", config->allowed_ip);
+    if (ipaddr_aton(config->local_ip, &ip_addr) != 1) {
+        ESP_LOGE(TAG, "ipaddr_aton: invalid local_ip: `%s`", config->local_ip);
         err = ESP_ERR_INVALID_ARG;
         goto fail;
     }
-    if (ipaddr_aton(config->allowed_ip_mask, &netmask) != 1) {
-        ESP_LOGE(TAG, "ipaddr_aton: invalid allowed_ip_mask: `%s`", config->allowed_ip_mask);
+    if (ipaddr_aton(config->local_ip_mask, &netmask) != 1) {
+        ESP_LOGE(TAG, "ipaddr_aton: invalid local_ip_mask: `%s`", config->local_ip_mask);
         err = ESP_ERR_INVALID_ARG;
         goto fail;
     }
+	if (config->gateway_ip) {
+	    if (ipaddr_aton(config->gateway_ip, &gateway) != 1) {
+	        ESP_LOGE(TAG, "ipaddr_aton: invalid gateway_ip: `%s`", config->gateway_ip);
+	        err = ESP_ERR_INVALID_ARG;
+	        goto fail;
+	    }
+	}
 
     /* Register the new WireGuard network interface with lwIP */
     wg_netif = netif_add(
-            &wg_netif_struct,
+            &wg->netif,
             ip_2_ip4(&ip_addr),
             ip_2_ip4(&netmask),
             ip_2_ip4(&gateway),
-            &wg, &wireguardif_init,
+            &ifinit, &wireguardif_init,
             &ip_input);
     if (wg_netif == NULL) {
         ESP_LOGE(TAG, "netif_add: failed");
@@ -212,142 +228,160 @@ fail:
     return err;
 }
 
-esp_err_t esp_wireguard_init(wireguard_config_t *config, wireguard_ctx_t *ctx)
-{
-    esp_err_t err = ESP_FAIL;
+esp_err_t esp_wireguard_init(const esp_wireguard_config_t *config, esp_wireguard_t *wg) {
+	if (!esp_wireguard_platform_init_done) {
+	    esp_err_t err = wireguard_platform_init();
+	    if (err) {
+	        ESP_LOGE(TAG, "wireguard_platform_init: %s", esp_err_to_name(err));
+			return err;
+	    }
+		esp_wireguard_platform_init_done = true;
+	}
 
-    if (!config || !ctx) {
-        err = ESP_ERR_INVALID_ARG;
-        goto fail;
-    }
+	memset(wg, 0, sizeof(*wg));
+	esp_err_t err = esp_wireguard_netif_create(config, wg);
+	if (err) {
+		ESP_LOGE(TAG, "esp_wireguard_netif_create: %s", esp_err_to_name(err));
+		return err;
+	}
+	esp_wireguard_if_cnt++;
 
-    err = wireguard_platform_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "wireguard_platform_init: %s", esp_err_to_name(err));
-        goto fail;
-    }
-    ctx->config = config;
-    ctx->netif = NULL;
-    ctx->netif_default = NULL;
-
-    err = ESP_OK;
-fail:
     return err;
 }
 
-esp_err_t esp_wireguard_connect(wireguard_ctx_t *ctx)
-{
+esp_err_t esp_wireguard_add_peer(const esp_wireguard_peer_config_t *config, esp_wireguard_t *wg, uint8_t *out_peer_index) {
     esp_err_t err = ESP_FAIL;
     err_t lwip_err = -1;
+	uint8_t psk[WG_KEY_LEN];
+	struct wireguardif_peer peer;
 
-    if (!ctx) {
+    if (!wg) {
         err = ESP_ERR_INVALID_ARG;
         goto fail;
     }
 
-    if (ctx->netif == NULL) {
-        err = esp_wireguard_netif_create(ctx->config);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "esp_wireguard_netif_create: %s", esp_err_to_name(err));
-            goto fail;
-        }
-
-        /* Initialize the first WireGuard peer structure */
-        err = esp_wireguard_peer_init(ctx->config, &peer);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "esp_wireguard_peer_init: %s", esp_err_to_name(err));
-            goto fail;
-        }
-
-        /* Register the new WireGuard peer with the network interface */
-        lwip_err = wireguardif_add_peer(wg_netif, &peer, &wireguard_peer_index);
-        if (lwip_err != ERR_OK || wireguard_peer_index == WIREGUARDIF_INVALID_INDEX) {
-            ESP_LOGE(TAG, "wireguardif_add_peer: %i", lwip_err);
-            goto fail;
-        }
-        if (ip_addr_isany(&peer.endpoint_ip)) {
-            err = ESP_FAIL;
-            goto fail;
-        }
-        ctx->netif = wg_netif;
+	err = esp_wireguard_peer_init(config, &peer, psk);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wireguard_peer_init: %s", esp_err_to_name(err));
+        goto fail;
     }
 
-    ESP_LOGI(TAG, "Connecting to %s:%i", ctx->config->endpoint, ctx->config->port);
-    lwip_err = wireguardif_connect(wg_netif, wireguard_peer_index);
-    if (lwip_err != ERR_OK) {
-        ESP_LOGE(TAG, "wireguardif_connect: %i", lwip_err);
+    /* Register the new WireGuard peer with the network interface */
+	uint8_t peer_idx;
+    lwip_err = wireguardif_add_peer(&wg->netif, &peer, &peer_idx);
+    if (lwip_err != ERR_OK || peer_idx == WIREGUARDIF_INVALID_INDEX) {
+        ESP_LOGE(TAG, "wireguardif_add_peer: %i", lwip_err);
+        goto fail;
+    }
+    if (ip_addr_isany(&peer.endpoint_ip)) {
         err = ESP_FAIL;
         goto fail;
     }
+	if (out_peer_index) {
+		*out_peer_index = peer_idx;
+	}
+
     err = ESP_OK;
 fail:
     return err;
 }
 
-esp_err_t esp_wireguard_set_default(wireguard_ctx_t *ctx)
-{
+esp_err_t esp_wireguard_connect_peer(esp_wireguard_t *wg, uint8_t peer_index) {
+    err_t lwip_err = wireguardif_connect(&wg->netif, peer_index);
+    if (lwip_err != ERR_OK) {
+        ESP_LOGE(TAG, "wireguardif_connect: %i", lwip_err);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t esp_wireguard_set_default(esp_wireguard_t *wg) {
     esp_err_t err;
-    if (!ctx) {
+    if (!wg) {
         err = ESP_ERR_INVALID_ARG;
         goto fail;
     }
-    ctx->netif_default = netif_default;
-	wireguardif_bind_underlying_weak(ctx->netif, ctx->netif_default);
-    netif_set_default(ctx->netif);
+    wg->netif_default = netif_default;
+	wireguardif_bind_underlying_weak(&wg->netif, wg->netif_default);
+    netif_set_default(&wg->netif);
     err = ESP_OK;
 fail:
     return err;
 }
 
-esp_err_t esp_wireguard_disconnect(wireguard_ctx_t *ctx)
-{
+esp_err_t esp_wireguard_disconnect_peer(esp_wireguard_t *wg, uint8_t peer_index) {
     esp_err_t err;
     err_t lwip_err;
 
-    if (!ctx) {
+    if (!wg) {
         err = ESP_ERR_INVALID_ARG;
         goto fail;
     }
 
-    lwip_err = wireguardif_disconnect(ctx->netif, wireguard_peer_index);
+    lwip_err = wireguardif_disconnect(&wg->netif, peer_index);
     if (lwip_err != ERR_OK) {
-        ESP_LOGW(TAG, "wireguardif_disconnect: peer_index: %" PRIu8 " err: %i", wireguard_peer_index, lwip_err);
+        ESP_LOGW(TAG, "wireguardif_disconnect: peer_index: %" PRIu8 " err: %i", peer_index, lwip_err);
     }
-
-    lwip_err = wireguardif_remove_peer(ctx->netif, wireguard_peer_index);
-    if (lwip_err != ERR_OK) {
-        ESP_LOGW(TAG, "wireguardif_remove_peer: peer_index: %" PRIu8 " err: %i", wireguard_peer_index, lwip_err);
-    }
-
-    wireguard_peer_index = WIREGUARDIF_INVALID_INDEX;
-    wireguardif_shutdown(ctx->netif);
-    netif_remove(ctx->netif);
-    if (ctx->netif_default) {
-		wireguardif_unbind_underlying_weak(ctx->netif);
-        netif_set_default(ctx->netif_default);
-    }
-    ctx->netif = NULL;
 
     err = ESP_OK;
 fail:
     return err;
 }
 
-esp_err_t esp_wireguardif_peer_is_up(wireguard_ctx_t *ctx)
-{
+esp_err_t esp_wireguard_remove_peer(esp_wireguard_t *wg, uint8_t peer_index) {
     esp_err_t err;
     err_t lwip_err;
 
-    if (!ctx) {
+    if (!wg) {
+        err = ESP_ERR_INVALID_ARG;
+        goto fail;
+    }
+
+    lwip_err = wireguardif_remove_peer(&wg->netif, peer_index);
+    if (lwip_err != ERR_OK) {
+        ESP_LOGW(TAG, "wireguardif_remove_peer: peer_index: %" PRIu8 " err: %i", peer_index, lwip_err);
+    }
+
+    err = ESP_OK;
+fail:
+    return err;
+}
+
+esp_err_t esp_wireguard_disconnect(esp_wireguard_t *wg) {
+    esp_err_t err;
+
+    if (!wg) {
+        err = ESP_ERR_INVALID_ARG;
+        goto fail;
+    }
+
+    if (wg->netif_default) {
+		wireguardif_unbind_underlying_weak(&wg->netif);
+        netif_set_default(wg->netif_default);
+		wg->netif_default = NULL;
+    }
+    wireguardif_shutdown(&wg->netif);
+    netif_remove(&wg->netif);
+    err = ESP_OK;
+fail:
+    return err;
+
+}
+
+esp_err_t esp_wireguard_peer_is_up(esp_wireguard_t *wg, uint8_t peer_index) {
+    esp_err_t err;
+    err_t lwip_err;
+
+    if (!wg) {
         err = ESP_ERR_INVALID_ARG;
         goto fail;
     }
 
     lwip_err = wireguardif_peer_is_up(
-            ctx->netif,
-            wireguard_peer_index,
-            &peer.endpoint_ip,
-            &peer.endport_port);
+            &wg->netif,
+            peer_index,
+			NULL,
+			NULL);
 
     if (lwip_err != ERR_OK) {
         err = ESP_FAIL;

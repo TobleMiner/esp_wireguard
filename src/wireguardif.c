@@ -35,6 +35,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <inttypes.h>
 #include <lwip/netif.h>
 #include <lwip/ip.h>
@@ -952,6 +953,7 @@ err_t wireguardif_init(struct netif *netif) {
 							netif->state = device;
 							netif->name[0] = 'w';
 							netif->name[1] = 'g';
+							snprintf(&netif->name[2], NETIF_NAMESIZE - 2, "%u", init_data->interface_num);
 							netif->output = wireguardif_output;
 							netif->linkoutput = NULL;
 							netif->hwaddr_len = 0;
